@@ -131,9 +131,13 @@ function StockCard({ stock, onEdit, onDelete }) {
         )}
 
         {/* 備註 */}
-        {note && (
+        {note ? (
           <div style={{ background:'#fffbeb', border:'1px solid #fde68a', borderRadius:'4px', padding:'6px 10px', fontSize:'11.5px', color:'#555' }}>
             📝 {note}
+          </div>
+        ) : (
+          <div style={{ background:'#f5f5f5', border:'1px dashed #ccc', borderRadius:'4px', padding:'6px 10px', fontSize:'11px', color:'#bbb' }}>
+            📝 尚無產業筆記
           </div>
         )}
       </div>
