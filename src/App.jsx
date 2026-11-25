@@ -18,10 +18,24 @@ const calcGates = (base, cur) =>
     }
   })
 
+// ── 以台灣時間（Asia/Taipei）取得 YYYY-MM-DD ──
+// 不用 toISOString()，因為那是 UTC，台灣早上 8 點前會變成前一天
+const taipeiDate = (d = new Date()) =>
+  new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(d)
+
+// ── 以台灣時間顯示日期與時間 ──
+const formatTaipeiDateTime = (ts) =>
+  new Date(ts).toLocaleString('zh-TW', {
+    timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  })
+
 // ── FinMind API 抓取股價 ──
 async function fetchPrice(code, token) {
   try {
-    const today = new Date().toISOString().split('T')[0]
+    const today = taipeiDate()
     const url = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${code}&start_date=${today}&token=${token}`
     const res  = await fetch(url)
     const json = await res.json()
@@ -29,9 +43,7 @@ async function fetchPrice(code, token) {
 
     // 今日無資料時，往前抓近期資料
     if (data.length === 0) {
-      const past = new Date()
-      past.setDate(past.getDate() - 10)
-      const pastDate = past.toISOString().split('T')[0]
+      const pastDate = taipeiDate(new Date(Date.now() - 10 * 24 * 60 * 60 * 1000))
       const url2 = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${code}&start_date=${pastDate}&token=${token}`
       const res2 = await fetch(url2)
       const json2 = await res2.json()
@@ -157,6 +169,7 @@ function StockForm({ initial, onSave, onCancel }) {
     }
     onSave({
       ...form,
+      code:   String(form.code).trim(),
       shares: parseFloat(form.shares),
       avg:    parseFloat(form.avg),
       price:  parseFloat(form.price) || parseFloat(form.avg),
@@ -179,7 +192,9 @@ function StockForm({ initial, onSave, onCancel }) {
       <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:'10px', marginBottom:'10px' }}>
         <div>
           <label style={labelStyle}>股票代號 *</label>
-          <input style={inputStyle} value={form.code} onChange={e=>set('code',e.target.value)} placeholder="例：2330" />
+          <input style={{ ...inputStyle, ...(initial ? { background:'#eee', color:'#888' } : {}) }}
+            value={form.code} onChange={e=>set('code',e.target.value)} placeholder="例：2330"
+            disabled={!!initial} title={initial ? '代號不可修改，如需更改請刪除後重新新增' : ''} />
         </div>
         <div>
           <label style={labelStyle}>股票名稱</label>
@@ -258,6 +273,8 @@ export default function App() {
   const [loading,      setLoading]      = useState(false)
   const [loadResult,   setLoadResult]   = useState('')
   const [activeTab,    setActiveTab]    = useState('report') // 'report' | 'manage'
+  const [lastUpdated,  setLastUpdated]  = useState(null)     // 最後成功抓取股價的時間（ms timestamp）
+  const [loaded,       setLoaded]       = useState(false)
 
   // ── 從 localStorage 讀取資料 ──
   useEffect(() => {
@@ -268,17 +285,33 @@ export default function App() {
         setStocks(data.stocks || [])
         setToken(data.token || '')
         setTokenInput(data.token || '')
+        setLastUpdated(data.lastUpdated || null)
       } catch {}
     }
+    setLoaded(true)
   }, [])
 
-  // ── 存入 localStorage（每次 stocks 或 token 改變時自動存）──
+  // ── 存入 localStorage（讀取完成後，每次資料改變時自動存）──
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ stocks, token }))
-  }, [stocks, token])
+    if (!loaded) return
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ stocks, token, lastUpdated }))
+  }, [stocks, token, lastUpdated, loaded])
 
-  // ── 新增股票 ──
+  // ── 新增股票（代號重複時詢問是否合併）──
   const handleAdd = (stock) => {
+    const existing = stocks.find(s => s.code === stock.code)
+    if (existing) {
+      const merge = window.confirm(
+        `${stock.code} 已在持倉中（${existing.shares.toLocaleString()} 股，均價 ${existing.avg}）。\n\n` +
+        `按「確定」合併：股數相加並重新計算加權平均成本。\n按「取消」則不新增。`
+      )
+      if (!merge) return
+      const shares = existing.shares + stock.shares
+      const avg    = +((existing.shares * existing.avg + stock.shares * stock.avg) / shares).toFixed(2)
+      setStocks(prev => prev.map(s => s.code === stock.code ? { ...s, shares, avg } : s))
+      setShowForm(false)
+      return
+    }
     setStocks(prev => [...prev, stock])
     setShowForm(false)
   }
@@ -313,6 +346,7 @@ export default function App() {
       }
     }
     setStocks(updated)
+    if (ok > 0) setLastUpdated(Date.now())
     setLoading(false)
     setLoadResult(`✅ 成功 ${ok} 檔　${fail > 0 ? `❌ 失敗 ${fail} 檔` : ''}`)
   }
@@ -323,14 +357,15 @@ export default function App() {
     alert('Token 已儲存！')
   }
 
-  // ── 匯出 JSON ──
+  // ── 匯出 JSON（不含 Token，避免外洩）──
   const exportJSON = () => {
-    const blob = new Blob([JSON.stringify({ stocks, token }, null, 2)], { type:'application/json' })
+    const blob = new Blob([JSON.stringify({ stocks, lastUpdated }, null, 2)], { type:'application/json' })
     const url  = URL.createObjectURL(blob)
     const a    = document.createElement('a')
     a.href     = url
-    a.download = `portfolio_${new Date().toISOString().split('T')[0]}.json`
+    a.download = `portfolio_${taipeiDate()}.json`
     a.click()
+    URL.revokeObjectURL(url)
   }
 
   // ── 匯入 JSON ──
@@ -342,7 +377,8 @@ export default function App() {
       try {
         const data = JSON.parse(ev.target.result)
         setStocks(data.stocks || [])
-        if (data.token) { setToken(data.token); setTokenInput(data.token) }
+        setLastUpdated(data.lastUpdated || null)
+        // 舊版備份檔可能含 Token：一律忽略，不覆蓋目前設定
         alert('匯入成功！')
       } catch {
         alert('檔案格式錯誤，請確認是正確的 JSON 檔案')
@@ -498,7 +534,7 @@ export default function App() {
                   {[
                     { label:'持倉檔數',       val:`${stocks.length} 檔`,                                                   color:'#111' },
                     { label:'未實現損益（估）', val:`${totalUnreal>=0?'+':''}${Math.round(totalUnreal).toLocaleString()}元`, color:totalUnreal>=0?UP:DOWN },
-                    { label:'最後更新',        val:new Date().toLocaleDateString('zh-TW'),                                  color:'#888' },
+                    { label:'最後更新',        val:lastUpdated ? formatTaipeiDateTime(lastUpdated) : '尚未更新',             color:'#888' },
                   ].map(item => (
                     <div key={item.label} style={{ background:'#fff', border:'1px solid #ddd', borderRadius:'6px', padding:'12px', textAlign:'center' }}>
                       <div style={{ fontSize:'10px', color:'#888', marginBottom:'4px' }}>{item.label}</div>
