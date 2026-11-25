@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 
 // ── 顏色常數（台股慣例：紅漲綠跌）──
 const UP   = '#c0392b'
@@ -31,6 +31,25 @@ const formatTaipeiDateTime = (ts) =>
     timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', hour12: false,
   })
+
+// ── 收盤後自動更新：判斷現在是否該自動抓股價 ──
+// 條件：台灣時間平日（週一～五）、已過 14:30（13:30 收盤後 FinMind 需要時間更新當日資料），
+// 且最後一次成功更新早於今天 14:30（早上手動更新過的盤中價，收盤後仍會再更新一次）
+// 註：國定假日無法判斷，當天會抓到前一個交易日的收盤價，不影響結果
+const AUTO_UPDATE_HOUR   = 14
+const AUTO_UPDATE_MINUTE = 30
+const taipeiWeekday = (d = new Date()) =>
+  new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Taipei', weekday: 'short' }).format(d)
+const shouldAutoUpdate = (lastUpdated, now = new Date()) => {
+  if (['Sat', 'Sun'].includes(taipeiWeekday(now))) return false
+  const hh = String(AUTO_UPDATE_HOUR).padStart(2, '0')
+  const mm = String(AUTO_UPDATE_MINUTE).padStart(2, '0')
+  const todayCutoff = Date.parse(`${taipeiDate(now)}T${hh}:${mm}:00+08:00`)
+  if (now.getTime() < todayCutoff) return false
+  return !lastUpdated || lastUpdated < todayCutoff
+}
+const AUTO_CHECK_INTERVAL = 60 * 1000        // 網頁開著時每分鐘檢查一次
+const AUTO_RETRY_INTERVAL = 30 * 60 * 1000   // 自動更新失敗後，30 分鐘後再試
 
 // ── FinMind API 抓取股價 ──
 async function fetchPrice(code, token) {
@@ -275,6 +294,8 @@ export default function App() {
   const [activeTab,    setActiveTab]    = useState('report') // 'report' | 'manage'
   const [lastUpdated,  setLastUpdated]  = useState(null)     // 最後成功抓取股價的時間（ms timestamp）
   const [loaded,       setLoaded]       = useState(false)
+  const [autoUpdate,   setAutoUpdate]   = useState(true)     // 收盤後自動更新開關
+  const lastAutoAttempt = useRef(0)                          // 上次自動更新嘗試時間，避免失敗時一直重試
 
   // ── 從 localStorage 讀取資料 ──
   useEffect(() => {
@@ -286,6 +307,7 @@ export default function App() {
         setToken(data.token || '')
         setTokenInput(data.token || '')
         setLastUpdated(data.lastUpdated || null)
+        setAutoUpdate(data.autoUpdate !== false)
       } catch {}
     }
     setLoaded(true)
@@ -294,8 +316,8 @@ export default function App() {
   // ── 存入 localStorage（讀取完成後，每次資料改變時自動存）──
   useEffect(() => {
     if (!loaded) return
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ stocks, token, lastUpdated }))
-  }, [stocks, token, lastUpdated, loaded])
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ stocks, token, lastUpdated, autoUpdate }))
+  }, [stocks, token, lastUpdated, autoUpdate, loaded])
 
   // ── 新增股票（代號重複時詢問是否合併）──
   const handleAdd = (stock) => {
@@ -330,8 +352,9 @@ export default function App() {
   }
 
   // ── 更新所有股價（FinMind API）──
-  const updateAllPrices = async () => {
-    if (!token) { alert('請先設定 FinMind Token！') ; return }
+  // auto = true 時為收盤後自動更新：沒有 Token 就靜默略過，結果訊息加上標示
+  const updateAllPrices = async (auto = false) => {
+    if (!token) { if (!auto) alert('請先設定 FinMind Token！') ; return }
     setLoading(true)
     setLoadResult('')
     let ok = 0, fail = 0
@@ -348,8 +371,26 @@ export default function App() {
     setStocks(updated)
     if (ok > 0) setLastUpdated(Date.now())
     setLoading(false)
-    setLoadResult(`✅ 成功 ${ok} 檔　${fail > 0 ? `❌ 失敗 ${fail} 檔` : ''}`)
+    const prefix = auto ? `🤖 收盤後已自動更新（${formatTaipeiDateTime(Date.now())}）　` : ''
+    setLoadResult(`${prefix}✅ 成功 ${ok} 檔　${fail > 0 ? `❌ 失敗 ${fail} 檔` : ''}`)
   }
+
+  // ── 收盤後自動更新：開網頁時檢查一次，之後網頁開著每分鐘檢查 ──
+  const updateRef = useRef(updateAllPrices)
+  updateRef.current = updateAllPrices
+  useEffect(() => {
+    if (!loaded || !autoUpdate || !token || stocks.length === 0) return
+    const check = () => {
+      if (loading) return
+      if (Date.now() - lastAutoAttempt.current < AUTO_RETRY_INTERVAL) return
+      if (!shouldAutoUpdate(lastUpdated)) return
+      lastAutoAttempt.current = Date.now()
+      updateRef.current(true)
+    }
+    check()
+    const id = setInterval(check, AUTO_CHECK_INTERVAL)
+    return () => clearInterval(id)
+  }, [loaded, autoUpdate, token, stocks.length, lastUpdated, loading])
 
   // ── 儲存 Token ──
   const saveToken = () => {
@@ -439,13 +480,24 @@ export default function App() {
               {token && <div style={{ marginTop:'6px', fontSize:'11px', color:DOWN }}>✅ Token 已設定（儲存於瀏覽器）</div>}
             </div>
 
+            {/* 收盤後自動更新開關 */}
+            <div style={{ background:'#fff', border:'1px solid #ddd', borderRadius:'8px', padding:'16px', marginBottom:'16px' }}>
+              <label style={{ display:'flex', alignItems:'center', gap:'8px', fontWeight:'700', fontSize:'13px', cursor:'pointer' }}>
+                <input type="checkbox" checked={autoUpdate} onChange={e => setAutoUpdate(e.target.checked)} />
+                🕝 收盤後自動更新股價
+              </label>
+              <div style={{ fontSize:'12px', color:'#888', marginTop:'6px' }}>
+                平日台灣時間 14:30 後，打開網頁（或網頁開著時）會自動抓一次當日收盤價。需要先設定 Token。
+              </div>
+            </div>
+
             {/* 操作按鈕列 */}
             <div style={{ display:'flex', gap:'8px', marginBottom:'16px', flexWrap:'wrap' }}>
               <button onClick={() => { setShowForm(true); setEditTarget(null) }}
                 style={{ padding:'8px 16px', background:'#111', color:'#fff', border:'none', borderRadius:'4px', fontSize:'13px', cursor:'pointer', fontWeight:'600' }}>
                 ➕ 新增股票
               </button>
-              <button onClick={updateAllPrices} disabled={loading}
+              <button onClick={() => updateAllPrices()} disabled={loading}
                 style={{ padding:'8px 16px', background:loading?'#aaa':'#1a5276', color:'#fff', border:'none', borderRadius:'4px', fontSize:'13px', cursor:loading?'not-allowed':'pointer', fontWeight:'600' }}>
                 {loading ? '⏳ 更新中...' : '🔄 更新所有股價'}
               </button>
@@ -505,7 +557,7 @@ export default function App() {
               <div style={{ fontSize:'12px', color:'#888' }}>
                 {stocks.length} 檔持倉　｜　資料自動儲存於瀏覽器
               </div>
-              <button onClick={updateAllPrices} disabled={loading}
+              <button onClick={() => updateAllPrices()} disabled={loading}
                 style={{ padding:'7px 14px', background:loading?'#aaa':'#1a5276', color:'#fff', border:'none', borderRadius:'4px', fontSize:'12px', cursor:loading?'not-allowed':'pointer', fontWeight:'600' }}>
                 {loading ? '⏳ 更新中...' : '🔄 更新股價'}
               </button>
